@@ -1,5 +1,5 @@
 # ============================================================
-# Post Link Fetcher Bot — Pyrogram
+# Post Link Fetcher Bot — Pyrogram bot + Telethon userbot
 # Telegram post ki link bhejo, uski file pao!
 #
 # Features:
@@ -10,17 +10,27 @@
 #  - PUBLIC bot — koi bhi user use kar sakta hai
 #  - 50 MB se badi file par mana kar deta hai (Bot API limit)
 #  - Link ke forms: t.me/<username>/<msg_id> aur t.me/c/<chat_id>/<msg_id>
-#  - USERBOT: SESSION_STRING se ek user account (dedicated link-bot
-#    account, user id 6278892307, no username) bhi chalata hai —
-#    private/protected channels ki posts fetch karne ke liye
-#    (jinmein bot account ko access nahi hai). Userbot na ho to
-#    bot account se fetch karta hai (public channels).
+#  - USERBOT (Telethon): SESSION_STRING se ek user account (dedicated
+#    link-bot account, user id 6278892307, no username) bhi chalata hai —
+#    private/protected channels ki posts fetch karne ke liye (jinmein bot
+#    account ko access nahi hai). Userbot na ho to bot account se fetch
+#    karta hai (public channels).
+#
+# KYUN TELETHON: Pyrogram ka userbot "Future attached to a different
+# loop" se fail hota raha — Pyrogram ka sync wrapper saare userbot
+# methods ko main loop par redirect kar deta hai, jabki userbot ka
+# Session alag loop se bandha hota hai. Isliye get_messages, get_dialogs,
+# join_chat sab fail hote the. Telethon natively async hai — koi sync
+# wrapper nahi — isliye uska get_entity/get_messages seedha chalta hai.
+# Test 2026-11-08: Telethon ne private channel -1004470825313 (title
+# "Zenox bro ise kro kuchh") ka msg 2 fetch kiya — vote.zip (11882 bytes).
+# Dono clients EK HI event loop (main loop) par chalte hain — app.run()
+# ka loop — isliye koi loop conflict nahi.
 # ============================================================
 
 import asyncio
 import os
 import re
-import threading
 import traceback
 from dotenv import load_dotenv, dotenv_values
 from pyrogram import Client, filters, raw, utils
@@ -33,7 +43,19 @@ from pyrogram.errors import (
     UsernameNotOccupied,
     MessageIdInvalid,
     FloodWait,
-    UserAlreadyParticipant,
+)
+from telethon import TelegramClient as TelethonClient
+from telethon.sessions import StringSession as TelethonStringSession
+from telethon.tl.functions.messages import (
+    CheckChatInviteRequest,
+    ImportChatInviteRequest,
+)
+from telethon.tl import types as tele_types
+from telethon.errors import (
+    FloodWaitError as TeleFloodWait,
+    ChannelPrivateError as TeleChannelPrivate,
+    InviteHashExpiredError as TeleInviteExpired,
+    InviteHashInvalidError as TeleInviteInvalid,
 )
 
 # ---------- Config ----------
@@ -51,6 +73,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "7966027018"))
 # Userbot session (dedicated link-bot account, user id 6278892307) —
 # env se hi padho, kabhi file mein hardcode mat karo, kabhi print mat karo.
+# ZAROORI: ye ab TELETHON StringSession hai (Pyrogram string nahi chalegi).
+# Pyrogram session se convert kiya gaya (convert_pyro_to_telethon.py) —
+# same auth key, sirf encoding alag hai.
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 DOWNLOADS_DIR = "downloads"
@@ -61,270 +86,110 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB in bytes
 
 app = Client("post_fetcher", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ---------- Userbot (alag thread mein) ----------
-# Userbot ek ALAG thread + apne event loop mein chalta hai, taaki
-# bot ka app.run() polling na toote. Pehle do clients ek hi loop
-# mein hone se bot reply karna band kar deta tha. Ab bot (main
-# thread, app.run) aur userbot (background thread) poori tarah
-# alag hain — sirf plain data (file path, naam, size) share hota hai.
-# Session: naya dedicated account (user id 6278892307, +91 8233779129)
-# — Costombomber TTS ke liye hai, ye link bot ke liye hai.
-#
-# ZAROORI: userbot ka Client USI thread ke andar banao jismein
-# uska loop chalega. Client module level (main thread) mein banane
-# par uska loop main loop se bandh jata hai, aur thread ke loop
-# mein use karne par "Future attached to a different loop" error
-# aata hai — fetch fail hota hai aur error flood se logs bhar jate
-# hain (Railway 500 logs/sec rate limit bhi lag jata hai).
-userbot = None
-userbot_loop = None
-userbot_ready = threading.Event()
+# ---------- Userbot (Telethon, main loop par) ----------
+# Telethon userbot — dedicated link-bot account (user id 6278892307).
+# Pyrogram userbot ko hata diya: uska sync wrapper saare methods ko
+# main loop par redirect karta tha, jabki Session alag loop se bandha
+# tha — get_messages/get_dialogs/join_chat sab "Future attached to a
+# different loop" se fail hote the. Telethon natively async hai, koi
+# sync wrapper nahi, isliye get_entity/get_messages seedha chalte hain.
+# Dono clients (Pyrogram bot + Telethon userbot) EK HI event loop par
+# chalte hain — app.run() ka main loop — isliye koi loop conflict nahi.
+# Telethon client ko start_telethon() se main loop par start karte hain,
+# phir app.run() usi loop par bot chalata hai.
+tele_client = None
 
 
-async def _userbot_main():
-    """Userbot ke loop mein chalao: client banao, start karo, phir ruko."""
-    global userbot
-    userbot = Client(
-        "post_fetcher_userbot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=SESSION_STRING,
-    )
-    await userbot.start()
-    me = await userbot.get_me()
-    print(f"Userbot shuru ho gaya: @{me.username}")
-    userbot_ready.set()
-    await asyncio.Event().wait()
-
-
-def _run_userbot_thread():
-    """Background thread: userbot ka apna event loop chalao."""
-    global userbot_loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    userbot_loop = loop
-    try:
-        # Poora lifecycle ek hi async function mein chalao, taaki
-        # start() sahi async context mein await ho.
-        loop.run_until_complete(_userbot_main())
-    except Exception as e:
-        print(f"Userbot start nahi hua ({e}) — bot-only mode mein chal raha hai.")
-        userbot_ready.set()
-
-
-def start_userbot_thread():
-    """Userbot thread shuru karo (agar SESSION_STRING ho)."""
+async def start_telethon():
+    """Telethon userbot ko main loop par start karo. SESSION_STRING ek
+    Telethon StringSession honi chahiye (Pyrogram string nahi chalegi)."""
+    global tele_client
     if not SESSION_STRING:
+        print("Telethon SESSION_STRING nahi hai — bot-only mode.")
         return False
-    t = threading.Thread(target=_run_userbot_thread, daemon=True)
-    t.start()
-    # Userbot ke ready hone ka thoda wait karo (max 15 sec).
-    userbot_ready.wait(timeout=15)
+    tele_client = TelethonClient(
+        TelethonStringSession(SESSION_STRING),
+        API_ID,
+        API_HASH,
+    )
+    await tele_client.start()
+    me = await tele_client.get_me()
+    print(f"Telethon userbot shuru ho gaya: @{me.username} ID:{me.id}")
     return True
 
 
-async def _userbot_sync_dialogs():
-    """Userbot ke loop mein chalao: saare dialogs sync karo aur peer
-    cache bharo. userbot.get_dialogs() wrapped Client method hai — sync
-    wrapper use main_loop par redirect kar deta hai, isliye wo cache
-    nahi bhar pata (yahi wajah thi jo pehle dialog refresh fail hota
-    raha). Seedha raw messages.GetDialogs via session.invoke use karte
-    hain (Session wrapped nahi hai), phir fetch_peers se saare chats
-    cache mein dalte hain. Account jis bhi channel ka member hai, wo
-    access_hash ke saath cache mein aa jata hai."""
-    if getattr(userbot, "session", None) is None:
-        return False
+async def tele_fetch(chat, msg_id, tmp_path, timeout=120):
+    """Bot ke handler se call karo: Telethon userbot se post fetch karo
+    + file download karo. Returns dict: {ok, has_file, file_name,
+    file_size, caption, tmp_path} — ya None (userbot na ho / fail ho).
+    chat: username (str) ya full chat ID (int, negative)."""
+    if tele_client is None:
+        return None
     try:
-        r = await userbot.session.invoke(
-            raw.functions.messages.GetDialogs(
-                offset_date=0,
-                offset_id=0,
-                offset_peer=raw.types.InputPeerEmpty(),
-                limit=100,
-                hash=0,
-            )
-        )
-        chats = getattr(r, "chats", []) or []
-        users = getattr(r, "users", []) or []
-        if chats:
-            await userbot.fetch_peers(chats)
-        if users:
-            await userbot.fetch_peers(users)
-        return True
-    except Exception:
-        print("Userbot sync_dialogs fail:")
-        traceback.print_exc()
-        return False
+        entity = await tele_client.get_entity(chat)
+        msg = await tele_client.get_messages(entity, ids=msg_id)
+        if not msg:
+            return {"ok": False, "error": "empty"}
+        f = msg.file
+        if f is None:
+            return {"ok": True, "has_file": False, "caption": msg.message}
+        file_name = f.name or f"file_{msg.id}"
+        file_size = f.size
+        if file_size and file_size > MAX_FILE_SIZE:
+            return {
+                "ok": False,
+                "error": "too_big",
+                "file_name": file_name,
+                "file_size": file_size,
+            }
+        await tele_client.download_media(msg, file=tmp_path)
+        return {
+            "ok": True,
+            "has_file": True,
+            "file_name": file_name,
+            "file_size": file_size,
+            "caption": msg.message,
+            "tmp_path": tmp_path,
+        }
+    except Exception as e:
+        print(f"Telethon fetch fail: {e}")
+        return None
 
 
-async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
-    """Userbot ke loop mein chalao: post fetch karo + file download karo.
-    Sirf plain data wapas do (Pyrogram objects thread ke bahar mat bhejo).
-
-    PeerIdInvalid aane par dialogs sync karke dobara try karo: Telegram
-    ko channel fetch karne ke liye uska access_hash chahiye, jo sirf
-    peer cache mein hota hai. Account channel ka member hone ke baad
-    bhi cache mein channel na ho to get_messages fail hota hai —
-    _userbot_sync_dialogs() (raw GetDialogs via session.invoke) cache
-    bhar deta hai, phir retry kaam karta hai."""
-    try:
-        msg = await userbot.get_messages(chat, msg_id)
-    except (PeerIdInvalid, KeyError, ValueError):
-        try:
-            await _userbot_sync_dialogs()
-        except Exception:
-            pass
-        msg = await userbot.get_messages(chat, msg_id)
-    if not msg or msg.empty:
-        return {"ok": False, "error": "empty"}
-    file_name, file_size = get_media_info(msg)
-    if not file_name:
-        return {"ok": True, "has_file": False, "caption": msg.caption}
-    if file_size and file_size > MAX_FILE_SIZE:
-        return {"ok": False, "error": "too_big", "file_name": file_name, "file_size": file_size}
-    await msg.download(file_name=tmp_path)
-    return {
-        "ok": True,
-        "has_file": True,
-        "file_name": file_name,
-        "file_size": file_size,
-        "caption": msg.caption,
-        "tmp_path": tmp_path,
-    }
-
-
-async def _userbot_join_and_resolve(invite_link):
-    """Userbot ke loop mein chalao: invite link se join karo, channel ko
-    peer cache mein daalo.
-
-    ROOT CAUSE (traceback se mila, deploy 26633032, 22:04 IST):
-    Pyrogram ke saare Client methods (join_chat, get_chat, invoke...)
-    sync.py ke async_to_sync wrapper se bandhe hote hain. Wrapper mein
-    ek GLOBAL main_loop hota hai (bot ke app.run() wala loop). Userbot
-    thread se method call karne par wrapper coroutine ko main_loop par
-    bhej deta hai (run_coroutine_threadsafe), jabki userbot ka Session
-    userbot_loop se bandha hai. Phir session.send() ka run_in_executor
-    userbot_loop ka Future banata hai, jise main_loop wala task await
-    karta hai — "Future attached to a different loop" error. Isiliye
-    get_chat bhi fail hua, join_chat bhi fail hua, chahe unhe userbot
-    loop ke andar hi kyun na chalaya gaya ho.
-
-    FIX: Client ke wrapped methods (join_chat/get_chat/invoke) use NAHI
-    karte. Seedha userbot.session.invoke() use karte hain (Session class
-    sync wrapper se bandha nahi hai — plain async method hai, current
-    loop = userbot_loop par chalta hai). Phir fetch_peers() se channel
-    ko cache mein dalte hain (fetch_peers Client par defined hai,
-    Methods par nahi, isliye wrapped nahi hai).
-
-    Returns dict: {ok, already, title, chat_id, error}."""
-    if getattr(userbot, "session", None) is None:
-        return {"ok": False, "error": "userbot session nahi mila"}
+async def tele_join(invite_link, timeout=60):
+    """Telethon userbot ko invite link se channel/group mein join karwao.
+    Returns dict: {ok, already, title, chat_id, error}.
+    CheckChatInviteRequest se pehle check karte hain — account pehle se
+    member ho to ChatInviteAlready milta hai (galat "link expire" nahi)."""
+    if tele_client is None:
+        return {"ok": False, "error": "userbot nahi chal raha"}
     m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", invite_link)
     if not m:
         return {"ok": False, "error": "invite link samajh nahi aayi"}
     invite_hash = m.group(1)
-
-    # 1) ImportChatInvite — join karne ki koshish karo.
     try:
-        r = await userbot.session.invoke(
-            raw.functions.messages.ImportChatInvite(hash=invite_hash)
-        )
-        # Result ke users/chats ko cache mein daalo.
-        try:
-            await userbot.fetch_peers(getattr(r, "users", []) or [])
-            await userbot.fetch_peers(getattr(r, "chats", []) or [])
-        except Exception:
-            traceback.print_exc()
-        chats = getattr(r, "chats", []) or []
-        if chats:
-            chat_obj = chats[0]
-            title = getattr(chat_obj, "title", None) or "channel"
-            if isinstance(chat_obj, raw.types.Channel):
-                chat_id = utils.get_channel_id(chat_obj.id)
-            elif isinstance(chat_obj, raw.types.Chat):
-                chat_id = -chat_obj.id
-            else:
-                chat_id = getattr(chat_obj, "id", None)
-            return {"ok": True, "already": False, "title": title, "chat_id": chat_id}
-        return {"ok": True, "already": False, "title": "channel", "chat_id": None}
-    except UserAlreadyParticipant:
-        # Account pehle se member hai — join nahi hoga, par channel ko
-        # cache mein dalna hai. Neeche CheckChatInvite se channel nikalo.
-        pass
-    except Exception:
-        print("Userbot ImportChatInvite fail:")
-        traceback.print_exc()
-        return {"ok": False, "error": "join fail (ImportChatInvite error)"}
-
-    # 2) Pehle se member hai — CheckChatInvite se channel ka object lo
-    # aur fetch_peers se cache mein daalo.
-    try:
-        r = await userbot.session.invoke(
-            raw.functions.messages.CheckChatInvite(hash=invite_hash)
-        )
-    except Exception:
-        print("Userbot CheckChatInvite fail:")
-        traceback.print_exc()
-        return {"ok": False, "error": "invite link resolve nahi hui (CheckChatInvite fail)"}
-    chat_obj = getattr(r, "chat", None)
-    if chat_obj is None:
-        return {"ok": False, "error": "invite link se channel nahi mila — link expire/galat ho sakti hai"}
-    try:
-        await userbot.fetch_peers([chat_obj])
-    except Exception:
-        print("Userbot fetch_peers fail:")
-        traceback.print_exc()
-    # CheckChatInvite ka channel min ho sakta hai (bina access_hash) —
-    # isliye poora dialog sync bhi karo, taaki channel access_hash ke
-    # saath cache mein aa jaye aur fetch turant kaam kare.
-    try:
-        await _userbot_sync_dialogs()
-    except Exception:
-        pass
-    if isinstance(chat_obj, raw.types.Channel):
-        chat_id = utils.get_channel_id(chat_obj.id)
-    elif isinstance(chat_obj, raw.types.Chat):
-        chat_id = -chat_obj.id
-    else:
-        chat_id = getattr(chat_obj, "id", None)
-    title = getattr(chat_obj, "title", None) or "channel"
-    return {"ok": True, "already": True, "title": title, "chat_id": chat_id}
-
-
-async def userbot_join(invite_link, timeout=60):
-    """Userbot ko invite link se channel/group mein join karwao.
-    Returns dict: {ok, already, title, chat_id, error}.
-    Apna coroutine userbot loop mein bhejta hai (fetch path jaisa) —
-    Pyrogram calls andar hoti hain, isliye loop error nahi aata."""
-    if userbot is None or userbot_loop is None:
-        return {"ok": False, "error": "userbot nahi chal raha"}
-    try:
-        fut = asyncio.run_coroutine_threadsafe(
-            _userbot_join_and_resolve(invite_link), userbot_loop
-        )
-        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+        res = await tele_client(CheckChatInviteRequest(invite_hash))
+        if isinstance(res, tele_types.ChatInviteAlready):
+            chat = res.chat
+            return {"ok": True, "already": True, **_tele_chat_info(chat)}
+        updates = await tele_client(ImportChatInviteRequest(invite_hash))
+        chats = getattr(updates, "chats", None) or []
+        if not chats:
+            return {"ok": False, "error": "join ke baad channel nahi mila"}
+        return {"ok": True, "already": False, **_tele_chat_info(chats[0])}
     except Exception as e:
-        print(f"Userbot join fail: {e}")
+        print(f"Telethon join fail: {e}")
         traceback.print_exc()
         return {"ok": False, "error": f"join fail: {e}"}
 
 
-async def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
-    """Bot ke handler se call karo: userbot thread par fetch+download
-    karwao aur result lo. ASYNC hai — wrap_future se main loop block
-    nahi hota (pehle fut.result() se loop 120 sec tak atak jata tha,
-    isliye naye messages ka reply bhi late aata tha).
-    Userbot na ho ya fail ho to None wapas do."""
-    if userbot is None or userbot_loop is None:
-        return None
-    try:
-        fut = asyncio.run_coroutine_threadsafe(
-            _userbot_fetch_and_download(chat, msg_id, tmp_path), userbot_loop
-        )
-        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
-    except Exception as e:
-        print(f"Userbot fetch fail: {e}")
-        return None
+def _tele_chat_info(chat):
+    """Telethon chat object se {title, chat_id} nikalo.
+    Channel ke liye full ID -100... hota hai, group ke liye -id."""
+    title = getattr(chat, "title", None) or "channel"
+    if isinstance(chat, tele_types.Channel):
+        return {"title": title, "chat_id": int("-100" + str(chat.id))}
+    return {"title": title, "chat_id": -chat.id}
 
 # ---------- Helpers ----------
 # Message mein se pehli t.me link nikalo
@@ -498,7 +363,7 @@ async def link_handler(client: Client, message: Message):
             return
         link = invite.group(0)
         status = await message.reply_text("🔗 Userbot ko channel mein join karwa raha hun, rukho...")
-        result = await userbot_join(link)
+        result = await tele_join(link)
         if result.get("ok"):
             if result.get("already"):
                 await status.edit_text(
@@ -540,13 +405,13 @@ async def link_handler(client: Client, message: Message):
 
     status = await message.reply_text("🔍 Post dhoondh raha hun, rukho...")
 
-    # PEHLE userbot se try karo (alag thread mein; private channels ke liye).
-    # Userbot fetch + download karke file path deta hai, bot use bhejta hai.
-    if userbot is not None and userbot_loop is not None:
+    # PEHLE Telethon userbot se try karo (main loop par; private channels ke liye).
+    # Telethon fetch + download karke file path deta hai, bot use bhejta hai.
+    if tele_client is not None:
         ub_tmp = os.path.join(
             DOWNLOADS_DIR, f"{message.from_user.id}_{msg_id}_ub.tmp"
         )
-        ub = await userbot_fetch(chat, msg_id, ub_tmp)
+        ub = await tele_fetch(chat, msg_id, ub_tmp)
         if ub is not None and ub.get("ok"):
             if not ub.get("has_file"):
                 await status.edit_text(
@@ -710,13 +575,16 @@ async def link_handler(client: Client, message: Message):
 # asyncio.run(main()) + app.start() + idle() se bot updates poll
 # nahi kar pa raha tha (Telegram par 17 updates pending mile,
 # chaar baar test karne par bhi koi reply nahi aaya).
-# Userbot ALAG thread mein chalta hai (start_userbot_thread), taaki
-# bot ka polling na toote — private channels ke liye.
+# Telethon userbot ko app.run() se PEHLE main loop par start karte
+# hain: app.run() asyncio.get_event_loop() use karta hai — wahi loop
+# jismein Telethon start hua — isliye dono clients ek hi loop par
+# chalte hain aur koi loop conflict nahi hota.
 if __name__ == "__main__":
     print("Post Link Fetcher Bot shuru ho raha hai...")
-    # Pehle userbot thread shuru karo (agar SESSION_STRING ho),
+    # Pehle Telethon userbot start karo (agar SESSION_STRING ho),
     # phir bot ko app.run() se chalao.
-    start_userbot_thread()
+    if SESSION_STRING:
+        asyncio.get_event_loop().run_until_complete(start_telethon())
     # app.run() bot ko start karke polling chalata hai aur
     # band hone tak rukta hai.
     app.run()
