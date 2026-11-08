@@ -128,7 +128,14 @@ async def tele_fetch(chat, msg_id, tmp_path, timeout=120):
     """Bot ke handler se call karo: Telethon userbot se post fetch karo
     + file download karo. Returns dict: {ok, has_file, file_name,
     file_size, caption, tmp_path} — ya None (userbot na ho / fail ho).
-    chat: username (str) ya full chat ID (int, negative)."""
+    chat: username (str) ya full chat ID (int, negative).
+
+    50 MB se badi file DOWNLOAD NAHI karte — uska Telethon message
+    wapas dete hain ("msg"), taaki handler use seedha reference se bhej
+    sake (send_file with msg.media). Download+upload ka round-trip
+    badi file ke liye bahut slow hota hai, aur temp naam se file bhej
+    jati hai; reference se bhejne par file turant jati hai aur original
+    naam bhi bana rehta hai."""
     if tele_client is None:
         return None
     try:
@@ -147,6 +154,18 @@ async def tele_fetch(chat, msg_id, tmp_path, timeout=120):
                 "error": "too_big",
                 "file_name": file_name,
                 "file_size": file_size,
+            }
+        # Badi file (Bot API 50 MB limit se upar): download mat karo,
+        # message hi wapas do — handler reference se bhejega.
+        if file_size and file_size > BOT_SEND_LIMIT:
+            return {
+                "ok": True,
+                "has_file": True,
+                "file_name": file_name,
+                "file_size": file_size,
+                "caption": msg.message,
+                "msg": msg,
+                "send_by_ref": True,
             }
         await tele_client.download_media(msg, file=tmp_path)
         return {
@@ -435,34 +454,32 @@ async def link_handler(client: Client, message: Message):
             # 50 MB se badi file Bot API se nahi bhej sakte (Telegram ki
             # hard limit) — isliye Telethon userbot use seedha user ko
             # bhejta hai (user account 2 GB tak bhej sakta hai).
+            # REFERENCE se bhejte hain (msg.media) — file download/upload
+            # nahi hoti, isliye turant jati hai aur original naam bhi
+            # bana rehta hai (temp naam "…_ub.tmp" nahi aata).
             if ub_size and ub_size > BOT_SEND_LIMIT:
                 try:
                     await tele_client.send_file(
                         message.from_user.id,
-                        ub["tmp_path"],
+                        ub["msg"].media,
                         caption=caption,
                     )
                     await status.edit_text(
                         "✅ **Ho gaya! File bhej di (userbot se, kyunki "
                         "file 50 MB se badi hai).**"
                     )
-                except FloodWait as e:
+                except TeleFloodWait as e:
                     await status.edit_text(
                         f"⏳ Telegram ne thoda rok lagayi hai. "
-                        f"{e.value} second baad dobara try karo."
+                        f"{e.seconds} second baad dobara try karo."
                     )
                 except Exception as e:
                     await status.edit_text(
                         "❌ **Badi file userbot se bhi nahi bhej paya.**\n\n"
                         f"Reason: {e}\n\n"
-                        "Userbot account ko pehle message karo, phir try karo."
+                        "Userbot account (+91 8233779129) ko pehle message "
+                        "karo, phir try karo."
                     )
-                finally:
-                    try:
-                        if os.path.exists(ub["tmp_path"]):
-                            os.remove(ub["tmp_path"])
-                    except OSError:
-                        pass
                 return
             try:
                 await client.send_document(
