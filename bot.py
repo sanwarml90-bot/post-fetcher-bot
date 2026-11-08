@@ -123,21 +123,55 @@ def start_userbot_thread():
     return True
 
 
+async def _userbot_sync_dialogs():
+    """Userbot ke loop mein chalao: saare dialogs sync karo aur peer
+    cache bharo. userbot.get_dialogs() wrapped Client method hai — sync
+    wrapper use main_loop par redirect kar deta hai, isliye wo cache
+    nahi bhar pata (yahi wajah thi jo pehle dialog refresh fail hota
+    raha). Seedha raw messages.GetDialogs via session.invoke use karte
+    hain (Session wrapped nahi hai), phir fetch_peers se saare chats
+    cache mein dalte hain. Account jis bhi channel ka member hai, wo
+    access_hash ke saath cache mein aa jata hai."""
+    if getattr(userbot, "session", None) is None:
+        return False
+    try:
+        r = await userbot.session.invoke(
+            raw.functions.messages.GetDialogs(
+                offset_date=0,
+                offset_id=0,
+                offset_peer=raw.types.InputPeerEmpty(),
+                limit=100,
+                hash=0,
+            )
+        )
+        chats = getattr(r, "chats", []) or []
+        users = getattr(r, "users", []) or []
+        if chats:
+            await userbot.fetch_peers(chats)
+        if users:
+            await userbot.fetch_peers(users)
+        return True
+    except Exception:
+        print("Userbot sync_dialogs fail:")
+        traceback.print_exc()
+        return False
+
+
 async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
     """Userbot ke loop mein chalao: post fetch karo + file download karo.
     Sirf plain data wapas do (Pyrogram objects thread ke bahar mat bhejo).
 
-    PeerIdInvalid aane par ek baar dialogs refresh karke dobara try karo:
-    Telegram ko channel fetch karne ke liye uska access_hash chahiye, jo
-    sirf peer cache mein hota hai. Account channel ka member hone ke
-    baad bhi cache mein channel na ho (join ke baad client ne sync na
-    kiya ho) to get_messages fail hota hai — get_dialogs() cache bhar
-    deta hai, phir retry kaam karta hai."""
+    PeerIdInvalid aane par dialogs sync karke dobara try karo: Telegram
+    ko channel fetch karne ke liye uska access_hash chahiye, jo sirf
+    peer cache mein hota hai. Account channel ka member hone ke baad
+    bhi cache mein channel na ho to get_messages fail hota hai —
+    _userbot_sync_dialogs() (raw GetDialogs via session.invoke) cache
+    bhar deta hai, phir retry kaam karta hai."""
     try:
         msg = await userbot.get_messages(chat, msg_id)
     except (PeerIdInvalid, KeyError, ValueError):
         try:
-            await userbot.get_dialogs()
+            await _userbot_sync_dialogs()
         except Exception:
             pass
         msg = await userbot.get_messages(chat, msg_id)
@@ -240,6 +274,13 @@ async def _userbot_join_and_resolve(invite_link):
     except Exception:
         print("Userbot fetch_peers fail:")
         traceback.print_exc()
+    # CheckChatInvite ka channel min ho sakta hai (bina access_hash) —
+    # isliye poora dialog sync bhi karo, taaki channel access_hash ke
+    # saath cache mein aa jaye aur fetch turant kaam kare.
+    try:
+        await _userbot_sync_dialogs()
+    except Exception:
+        pass
     if isinstance(chat_obj, raw.types.Channel):
         chat_id = utils.get_channel_id(chat_obj.id)
     elif isinstance(chat_obj, raw.types.Chat):
