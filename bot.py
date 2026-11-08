@@ -173,6 +173,9 @@ async def userbot_join(invite_link, timeout=60):
     except Exception as e:
         print(f"Userbot join fail: {e}")
         return None
+
+
+async def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
     """Bot ke handler se call karo: userbot thread par fetch+download
     karwao aur result lo. ASYNC hai — wrap_future se main loop block
     nahi hota (pehle fut.result() se loop 120 sec tak atak jata tha,
