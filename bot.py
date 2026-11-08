@@ -16,11 +16,10 @@
 #    ho to bot account se fetch karta hai (public channels).
 # ============================================================
 
-import asyncio
 import os
 import re
 from dotenv import load_dotenv, dotenv_values
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import (
     PeerIdInvalid,
@@ -364,28 +363,15 @@ async def link_handler(client: Client, message: Message):
 
 
 # ---------- Run ----------
-async def main():
-    """Bot shuru karo (bot-only mode; userbot band hai).
-    idle() hi use karo — yehi woh tareeka hai jo 10:27 IST tak
-    kaam kar raha tha. asyncio.Event().wait() se bot updates
-    poll nahi kar pa raha tha (Telegram par 17 updates pending
-    mile), isliye idle() wapas la rahe hain."""
-    global userbot
-    if userbot is not None:
-        try:
-            await userbot.start()
-            me = await userbot.get_me()
-            print(f"Userbot shuru ho gaya: @{me.username}")
-        except Exception as e:
-            # Userbot session kharab ho to bot-only mode mein chalao,
-            # poora bot band mat karo.
-            print(f"Userbot start nahi hua ({e}) — bot-only mode mein chal raha hai.")
-            userbot = None
-    await app.start()
-    print("Post Link Fetcher Bot online hai.")
-    await idle()
-
-
+# Pyrogram ka built-in runner use karo (app.run) — ye event loop,
+# startup aur polling sab khud sambhalta hai. Manual
+# asyncio.run(main()) + app.start() + idle() se bot updates poll
+# nahi kar pa raha tha (Telegram par 17 updates pending mile,
+# chaar baar test karne par bhi koi reply nahi aaya).
+# Userbot abhi band hai (bot-only mode); use alag service mein
+# chalana padega, is process mein nahi.
 if __name__ == "__main__":
     print("Post Link Fetcher Bot shuru ho raha hai...")
-    asyncio.run(main())
+    # app.run() bot ko start karke polling chalata hai aur
+    # band hone tak rukta hai.
+    app.run()
