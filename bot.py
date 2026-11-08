@@ -44,6 +44,9 @@ _aand_env = dotenv_values(os.path.expanduser("~/workspace/aand_bot/.env"))
 API_ID = int(os.getenv("API_ID") or _aand_env.get("API_ID", "0"))
 API_HASH = os.getenv("API_HASH") or _aand_env.get("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# Sirf owner (Sanji) userbot ko kisi channel mein join karwa sakta hai
+# (invite link bhej kar). Owner ID = admin chat 7966027018.
+OWNER_ID = int(os.getenv("OWNER_ID", "7966027018"))
 # Userbot session (dedicated link-bot account, user id 6278892307) —
 # env se hi padho, kabhi file mein hardcode mat karo, kabhi print mat karo.
 SESSION_STRING = os.getenv("SESSION_STRING", "")
@@ -120,8 +123,22 @@ def start_userbot_thread():
 
 async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
     """Userbot ke loop mein chalao: post fetch karo + file download karo.
-    Sirf plain data wapas do (Pyrogram objects thread ke bahar mat bhejo)."""
-    msg = await userbot.get_messages(chat, msg_id)
+    Sirf plain data wapas do (Pyrogram objects thread ke bahar mat bhejo).
+
+    PeerIdInvalid aane par ek baar dialogs refresh karke dobara try karo:
+    Telegram ko channel fetch karne ke liye uska access_hash chahiye, jo
+    sirf peer cache mein hota hai. Account channel ka member hone ke
+    baad bhi cache mein channel na ho (join ke baad client ne sync na
+    kiya ho) to get_messages fail hota hai — get_dialogs() cache bhar
+    deta hai, phir retry kaam karta hai."""
+    try:
+        msg = await userbot.get_messages(chat, msg_id)
+    except (PeerIdInvalid, KeyError, ValueError):
+        try:
+            await userbot.get_dialogs()
+        except Exception:
+            pass
+        msg = await userbot.get_messages(chat, msg_id)
     if not msg or msg.empty:
         return {"ok": False, "error": "empty"}
     file_name, file_size = get_media_info(msg)
@@ -140,7 +157,22 @@ async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
     }
 
 
-async def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
+async def userbot_join(invite_link, timeout=60):
+    """Userbot ko ek channel/group mein invite link se join karwao.
+    Sirf owner ke liye hai (private channel fetch ke liye account ko
+    member banana padta hai). Join hone par channel ka naam wapas do,
+    fail hone par None."""
+    if userbot is None or userbot_loop is None:
+        return None
+    try:
+        fut = asyncio.run_coroutine_threadsafe(
+            userbot.join_chat(invite_link), userbot_loop
+        )
+        chat = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+        return getattr(chat, "title", None) or getattr(chat, "username", None) or "channel"
+    except Exception as e:
+        print(f"Userbot join fail: {e}")
+        return None
     """Bot ke handler se call karo: userbot thread par fetch+download
     karwao aur result lo. ASYNC hai — wrap_future se main loop block
     nahi hota (pehle fut.result() se loop 120 sec tak atak jata tha,
@@ -160,6 +192,10 @@ async def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
 # ---------- Helpers ----------
 # Message mein se pehli t.me link nikalo
 LINK_RE = re.compile(r"(?:https?://)?t\.me/\S+", re.IGNORECASE)
+# Invite link: t.me/+XXXX ya t.me/joinchat/XXXX (https:// bhi)
+INVITE_RE = re.compile(
+    r"(?:https?://)?t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]+", re.IGNORECASE
+)
 
 
 def extract_link(text: str):
@@ -312,6 +348,32 @@ async def help_handler(client: Client, message: Message):
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "help"]))
 async def link_handler(client: Client, message: Message):
     text = message.text or ""
+
+    # INVITE LINK: owner userbot ko kisi private channel mein join karwana
+    # chahta hai (uske baad us channel ki posts fetch ho jayengi).
+    # Sirf owner (Sanji) ke liye — baaki users ko mana kar do.
+    invite = INVITE_RE.search(text)
+    if invite:
+        if message.from_user.id != OWNER_ID:
+            await message.reply_text(
+                "🔒 Ye feature sirf bot ke owner ke liye hai."
+            )
+            return
+        link = invite.group(0)
+        status = await message.reply_text("🔗 Userbot ko channel mein join karwa raha hun, rukho...")
+        joined = await userbot_join(link)
+        if joined:
+            await status.edit_text(
+                f"✅ **Userbot join ho gaya: {joined}**\n\n"
+                "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
+            )
+        else:
+            await status.edit_text(
+                "❌ **Join nahi ho paya.**\n\n"
+                "Invite link galat/expire ho gayi hogi, ya userbot ko join "
+                "karne ki permission nahi hai. Link dobara check karo."
+            )
+        return
 
     # Message mein se t.me link nikalo
     link = extract_link(text)
