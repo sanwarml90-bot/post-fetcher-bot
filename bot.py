@@ -32,6 +32,7 @@ from pyrogram.errors import (
     UsernameNotOccupied,
     MessageIdInvalid,
     FloodWait,
+    UserAlreadyParticipant,
 )
 
 # ---------- Config ----------
@@ -157,22 +158,54 @@ async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
     }
 
 
+async def _run_on_userbot_loop(coro, timeout=60):
+    """Userbot ke loop par ek coroutine chalao, result lo."""
+    fut = asyncio.run_coroutine_threadsafe(coro, userbot_loop)
+    return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+
+
 async def userbot_join(invite_link, timeout=60):
-    """Userbot ko ek channel/group mein invite link se join karwao.
-    Sirf owner ke liye hai (private channel fetch ke liye account ko
-    member banana padta hai). Join hone par channel ka naam wapas do,
-    fail hone par None."""
+    """Userbot ko invite link se channel/group mein join karwao.
+    Returns dict: {ok, already, title, chat_id, error}.
+    - Pehle invite link resolve karke channel ka pata lagao
+      (get_chat) — is se peer cache bhi bhar jata hai, phir
+      us channel ki post fetch kaam karti hai.
+    - Account pehle se member ho (UserAlreadyParticipant) to use
+      SUCCESS mano, fail nahi. Pehle ye case galat tareeke se
+      "link galat/expire" bol kar fail ho jata tha — jabki link
+      sahi hoti thi, account pehle se joined hota tha."""
     if userbot is None or userbot_loop is None:
-        return None
+        return {"ok": False, "error": "userbot nahi chal raha"}
     try:
-        fut = asyncio.run_coroutine_threadsafe(
-            userbot.join_chat(invite_link), userbot_loop
+        chat = await _run_on_userbot_loop(
+            userbot.get_chat(invite_link), timeout=timeout
         )
-        chat = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
-        return getattr(chat, "title", None) or getattr(chat, "username", None) or "channel"
+    except Exception as e:
+        print(f"Userbot invite resolve fail: {e}")
+        return {"ok": False, "error": f"invite link resolve nahi hui: {e}"}
+    title = getattr(chat, "title", None) or getattr(chat, "username", None) or "channel"
+    chat_id = getattr(chat, "id", None)
+    already = False
+    try:
+        await _run_on_userbot_loop(
+            userbot.join_chat(invite_link), timeout=timeout
+        )
+    except UserAlreadyParticipant:
+        already = True
     except Exception as e:
         print(f"Userbot join fail: {e}")
-        return None
+        return {
+            "ok": False,
+            "error": f"join fail: {e}",
+            "title": title,
+            "chat_id": chat_id,
+        }
+    # Cache check: join ke baad channel resolve ho raha hai ya nahi
+    try:
+        await _run_on_userbot_loop(userbot.resolve_peer(chat_id), timeout=30)
+    except Exception as e:
+        print(f"Userbot resolve_peer fail after join: {e}")
+    return {"ok": True, "already": already, "title": title, "chat_id": chat_id}
 
 
 async def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
@@ -364,17 +397,21 @@ async def link_handler(client: Client, message: Message):
             return
         link = invite.group(0)
         status = await message.reply_text("🔗 Userbot ko channel mein join karwa raha hun, rukho...")
-        joined = await userbot_join(link)
-        if joined:
-            await status.edit_text(
-                f"✅ **Userbot join ho gaya: {joined}**\n\n"
-                "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
-            )
+        result = await userbot_join(link)
+        if result.get("ok"):
+            if result.get("already"):
+                await status.edit_text(
+                    f"✅ **Account pehle se hi is channel mein hai: {result.get('title')}**\n\n"
+                    "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
+                )
+            else:
+                await status.edit_text(
+                    f"✅ **Userbot join ho gaya: {result.get('title')}**\n\n"
+                    "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
+                )
         else:
             await status.edit_text(
-                "❌ **Join nahi ho paya.**\n\n"
-                "Invite link galat/expire ho gayi hogi, ya userbot ko join "
-                "karne ki permission nahi hai. Link dobara check karo."
+                f"❌ **Join nahi ho paya.**\n\nReason: {result.get('error')}"
             )
         return
 
