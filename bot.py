@@ -8,7 +8,9 @@
 #    (document, photo, video, audio, animation, voice, video note)
 #  - Photo ko document ke roop mein bhejta hai (quality bani rahe)
 #  - PUBLIC bot — koi bhi user use kar sakta hai
-#  - 50 MB se badi file par mana kar deta hai (Bot API limit)
+#  - 50 MB tak ki file bot bhejta hai; 50 MB se 500 MB tak ki file
+#    Telethon userbot seedha user ko bhejta hai (Bot API ki 50 MB limit
+#    ki wajah se)
 #  - Link ke forms: t.me/<username>/<msg_id> aur t.me/c/<chat_id>/<msg_id>
 #  - USERBOT (Telethon): SESSION_STRING se ek user account (dedicated
 #    link-bot account, user id 6278892307, no username) bhi chalata hai —
@@ -81,8 +83,12 @@ SESSION_STRING = os.getenv("SESSION_STRING", "")
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Bot API limit: 50 MB se badi file fetch nahi kar sakta
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB in bytes
+# Bot API limit: bot account sirf 50 MB tak bhej sakta hai (Telegram ki
+# hard limit — code se nahi badh sakti). Isliye 50 MB se badi file ko
+# Telethon userbot seedha user ko bhejta hai (user account 2 GB tak
+# bhej sakta hai). Fetch ki limit 500 MB hai.
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB in bytes
+BOT_SEND_LIMIT = 50 * 1024 * 1024  # 50 MB — Bot API send limit
 
 app = Client("post_fetcher", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -318,7 +324,8 @@ async def start_handler(client: Client, message: Message):
         "• Public channels ki posts ke liye kaam karta hai\n"
         "• Private/protected (no-forward) channels ki posts bhi fetch kar leta hai — "
         "userbot account unka member hai, isliye bot ko add karne ki zaroorat nahi\n"
-        "• Sirf **50 MB** tak ki files fetch kar sakta hai\n\n"
+        "• **500 MB** tak ki files fetch kar sakta hai (50 MB se badi file "
+        "userbot se seedha bhejta hai)\n\n"
         "👉 Ab ek post ki link bhej kar try karo!"
     )
 
@@ -425,6 +432,38 @@ async def link_handler(client: Client, message: Message):
             caption = f"📦 **File mil gayi!**\n\n📄 **Naam:** `{ub_name}`"
             if ub_caption:
                 caption += f"\n\n💬 **Caption:** {ub_caption}"
+            # 50 MB se badi file Bot API se nahi bhej sakte (Telegram ki
+            # hard limit) — isliye Telethon userbot use seedha user ko
+            # bhejta hai (user account 2 GB tak bhej sakta hai).
+            if ub_size and ub_size > BOT_SEND_LIMIT:
+                try:
+                    await tele_client.send_file(
+                        message.from_user.id,
+                        ub["tmp_path"],
+                        caption=caption,
+                    )
+                    await status.edit_text(
+                        "✅ **Ho gaya! File bhej di (userbot se, kyunki "
+                        "file 50 MB se badi hai).**"
+                    )
+                except FloodWait as e:
+                    await status.edit_text(
+                        f"⏳ Telegram ne thoda rok lagayi hai. "
+                        f"{e.value} second baad dobara try karo."
+                    )
+                except Exception as e:
+                    await status.edit_text(
+                        "❌ **Badi file userbot se bhi nahi bhej paya.**\n\n"
+                        f"Reason: {e}\n\n"
+                        "Userbot account ko pehle message karo, phir try karo."
+                    )
+                finally:
+                    try:
+                        if os.path.exists(ub["tmp_path"]):
+                            os.remove(ub["tmp_path"])
+                    except OSError:
+                        pass
+                return
             try:
                 await client.send_document(
                     message.chat.id,
@@ -450,7 +489,7 @@ async def link_handler(client: Client, message: Message):
         if ub is not None and ub.get("error") == "too_big":
             await status.edit_text(
                 f"❌ **File bahut badi hai ({format_size(ub.get('file_size'))}).**\n\n"
-                f"Bot sirf **50 MB** tak ki file fetch kar sakta hai."
+                f"Bot sirf **500 MB** tak ki file fetch kar sakta hai."
             )
             return
         # Userbot fail (jaise account channel ka member nahi) —
@@ -511,11 +550,12 @@ async def link_handler(client: Client, message: Message):
         )
         return
 
-    # File size check (50 MB limit)
-    if file_size and file_size > MAX_FILE_SIZE:
+    # File size check (Bot API 50 MB limit — bot account se zyada nahi bhej sakte)
+    if file_size and file_size > BOT_SEND_LIMIT:
         await status.edit_text(
             f"❌ **File bahut badi hai ({format_size(file_size)}).**\n\n"
-            f"Bot sirf **50 MB** tak ki file fetch kar sakta hai."
+            f"Bot account se sirf **50 MB** tak ki file bhej sakta hai. "
+            f"Badi file ke liye userbot wala rasta use hota hai."
         )
         return
 
