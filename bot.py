@@ -54,11 +54,14 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB in bytes
 
 app = Client("post_fetcher", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Userbot client (@Costombomber) — sirf tab banao jab SESSION_STRING ho.
-# Ye private/protected channels ki posts fetch karta hai, kyunki ye
-# account un channels ka member hai. Bot sirf file wapas bhejta hai.
+# Userbot client — ABHI BAND HAI (ENABLE_USERBOT=1 se chalega).
+# Do clients ek hi process mein hone se bot reply karna band kar
+# deta hai (pehle @Costombomber session share karne se, phir naye
+# dedicated session se bhi reply nahi aaya). Isliye abhi sirf bot
+# account chal raha hai — public posts fetch honge, private channel
+# ke liye userbot ko alag process/service mein chalana padega.
 userbot = None
-if SESSION_STRING:
+if SESSION_STRING and os.getenv("ENABLE_USERBOT", "0") == "1":
     userbot = Client(
         "post_fetcher_userbot",
         api_id=API_ID,
