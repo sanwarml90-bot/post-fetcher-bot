@@ -16,8 +16,10 @@
 #    ho to bot account se fetch karta hai (public channels).
 # ============================================================
 
+import asyncio
 import os
 import re
+import threading
 from dotenv import load_dotenv, dotenv_values
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -53,20 +55,90 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB in bytes
 
 app = Client("post_fetcher", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Userbot client — ABHI BAND HAI (ENABLE_USERBOT=1 se chalega).
-# Do clients ek hi process mein hone se bot reply karna band kar
-# deta hai (pehle @Costombomber session share karne se, phir naye
-# dedicated session se bhi reply nahi aaya). Isliye abhi sirf bot
-# account chal raha hai — public posts fetch honge, private channel
-# ke liye userbot ko alag process/service mein chalana padega.
+# ---------- Userbot (alag thread mein) ----------
+# Userbot ek ALAG thread + apne event loop mein chalta hai, taaki
+# bot ka app.run() polling na toote. Pehle do clients ek hi loop
+# mein hone se bot reply karna band kar deta tha. Ab bot (main
+# thread, app.run) aur userbot (background thread) poori tarah
+# alag hain — sirf plain data (file path, naam, size) share hota hai.
+# Session: naya dedicated account (user id 6278892307, +91 8233779129)
+# — Costombomber TTS ke liye hai, ye link bot ke liye hai.
 userbot = None
-if SESSION_STRING and os.getenv("ENABLE_USERBOT", "0") == "1":
+userbot_loop = None
+userbot_ready = threading.Event()
+
+if SESSION_STRING:
     userbot = Client(
         "post_fetcher_userbot",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING,
     )
+
+
+def _run_userbot_thread():
+    """Background thread: userbot ka apna event loop chalao."""
+    global userbot_loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    userbot_loop = loop
+    try:
+        loop.run_until_complete(userbot.start())
+        me = loop.run_until_complete(userbot.get_me())
+        print(f"Userbot shuru ho gaya: @{me.username}")
+        userbot_ready.set()
+        loop.run_forever()
+    except Exception as e:
+        print(f"Userbot start nahi hua ({e}) — bot-only mode mein chal raha hai.")
+        userbot_ready.set()
+
+
+def start_userbot_thread():
+    """Userbot thread shuru karo (agar SESSION_STRING ho)."""
+    if userbot is None:
+        return False
+    t = threading.Thread(target=_run_userbot_thread, daemon=True)
+    t.start()
+    # Userbot ke ready hone ka thoda wait karo (max 15 sec).
+    userbot_ready.wait(timeout=15)
+    return True
+
+
+async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
+    """Userbot ke loop mein chalao: post fetch karo + file download karo.
+    Sirf plain data wapas do (Pyrogram objects thread ke bahar mat bhejo)."""
+    msg = await userbot.get_messages(chat, msg_id)
+    if not msg or msg.empty:
+        return {"ok": False, "error": "empty"}
+    file_name, file_size = get_media_info(msg)
+    if not file_name:
+        return {"ok": True, "has_file": False, "caption": msg.caption}
+    if file_size and file_size > MAX_FILE_SIZE:
+        return {"ok": False, "error": "too_big", "file_name": file_name, "file_size": file_size}
+    await msg.download(file_name=tmp_path)
+    return {
+        "ok": True,
+        "has_file": True,
+        "file_name": file_name,
+        "file_size": file_size,
+        "caption": msg.caption,
+        "tmp_path": tmp_path,
+    }
+
+
+def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
+    """Bot ke handler se call karo: userbot thread par fetch+download
+    karwao aur result lo. Userbot na ho ya fail ho to None wapas do."""
+    if userbot is None or userbot_loop is None:
+        return None
+    try:
+        fut = asyncio.run_coroutine_threadsafe(
+            _userbot_fetch_and_download(chat, msg_id, tmp_path), userbot_loop
+        )
+        return fut.result(timeout=timeout)
+    except Exception as e:
+        print(f"Userbot fetch fail: {e}")
+        return None
 
 # ---------- Helpers ----------
 # Message mein se pehli t.me link nikalo
@@ -248,10 +320,60 @@ async def link_handler(client: Client, message: Message):
 
     status = await message.reply_text("🔍 Post dhoondh raha hun, rukho...")
 
-    # Post fetch karo — pehle userbot se (private/protected channels ke liye),
-    # userbot na ho to bot account se (public channels ke liye).
+    # PEHLE userbot se try karo (alag thread mein; private channels ke liye).
+    # Userbot fetch + download karke file path deta hai, bot use bhejta hai.
+    if userbot is not None and userbot_loop is not None:
+        ub_tmp = os.path.join(
+            DOWNLOADS_DIR, f"{message.from_user.id}_{msg_id}_ub.tmp"
+        )
+        ub = userbot_fetch(chat, msg_id, ub_tmp)
+        if ub is not None and ub.get("ok"):
+            if not ub.get("has_file"):
+                await status.edit_text(
+                    "📝 **Is post mein koi file nahi hai.**\n\n"
+                    "Ye post sirf text hai — ismein koi photo, video ya file nahi hai."
+                )
+                return
+            ub_name = ub["file_name"]
+            ub_size = ub.get("file_size")
+            ub_caption = ub.get("caption") or ""
+            caption = f"📦 **File mil gayi!**\n\n📄 **Naam:** `{ub_name}`"
+            if ub_caption:
+                caption += f"\n\n💬 **Caption:** {ub_caption}"
+            try:
+                await client.send_document(
+                    message.chat.id,
+                    ub["tmp_path"],
+                    file_name=ub_name,
+                    caption=caption,
+                )
+                await status.edit_text("✅ **Ho gaya! File upar bhej di.**")
+            except FloodWait as e:
+                await status.edit_text(
+                    f"⏳ Telegram ne thoda rok lagayi hai. "
+                    f"{e.value} second baad dobara try karo."
+                )
+            except Exception as e:
+                await status.edit_text(f"❌ Bhejne mein error aaya: {e}")
+            finally:
+                try:
+                    if os.path.exists(ub["tmp_path"]):
+                        os.remove(ub["tmp_path"])
+                except OSError:
+                    pass
+            return
+        if ub is not None and ub.get("error") == "too_big":
+            await status.edit_text(
+                f"❌ **File bahut badi hai ({format_size(ub.get('file_size'))}).**\n\n"
+                f"Bot sirf **50 MB** tak ki file fetch kar sakta hai."
+            )
+            return
+        # Userbot fail (jaise account channel ka member nahi) —
+        # neeche bot account se try karo (public channels ke liye).
+
+    # Post fetch karo — bot account se (public channels ke liye).
     # msg.download() usi client se hota hai jisne message fetch kiya.
-    fetch_client = userbot if userbot is not None else client
+    fetch_client = client
     try:
         msg = await fetch_client.get_messages(chat, msg_id)
     except FloodWait as e:
@@ -368,10 +490,13 @@ async def link_handler(client: Client, message: Message):
 # asyncio.run(main()) + app.start() + idle() se bot updates poll
 # nahi kar pa raha tha (Telegram par 17 updates pending mile,
 # chaar baar test karne par bhi koi reply nahi aaya).
-# Userbot abhi band hai (bot-only mode); use alag service mein
-# chalana padega, is process mein nahi.
+# Userbot ALAG thread mein chalta hai (start_userbot_thread), taaki
+# bot ka polling na toote — private channels ke liye.
 if __name__ == "__main__":
     print("Post Link Fetcher Bot shuru ho raha hai...")
+    # Pehle userbot thread shuru karo (agar SESSION_STRING ho),
+    # phir bot ko app.run() se chalao.
+    start_userbot_thread()
     # app.run() bot ko start karke polling chalata hai aur
     # band hone tak rukta hai.
     app.run()
