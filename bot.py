@@ -163,42 +163,70 @@ async def _userbot_join_and_resolve(invite_link):
     """Userbot ke loop mein chalao: invite link se join karo, channel ko
     peer cache mein daalo.
 
-    get_chat() use NAHI karte — uske andar GetFullChannel +
-    Chat._parse_full "Future attached to a different loop" error deta
-    hai (do deploy mein fail ho chuka hai). Seedha join_chat
-    (ImportChatInvite) + CheckChatInvite + fetch_peers use karte hain —
-    ye sab invoke wale raste se hote hain, jo fetch mein kaam karta hai.
-    Har fail par poora traceback log karte hain, taaki aage diagnose ho sake.
+    ROOT CAUSE (traceback se mila, deploy 26633032, 22:04 IST):
+    Pyrogram ke saare Client methods (join_chat, get_chat, invoke...)
+    sync.py ke async_to_sync wrapper se bandhe hote hain. Wrapper mein
+    ek GLOBAL main_loop hota hai (bot ke app.run() wala loop). Userbot
+    thread se method call karne par wrapper coroutine ko main_loop par
+    bhej deta hai (run_coroutine_threadsafe), jabki userbot ka Session
+    userbot_loop se bandha hai. Phir session.send() ka run_in_executor
+    userbot_loop ka Future banata hai, jise main_loop wala task await
+    karta hai — "Future attached to a different loop" error. Isiliye
+    get_chat bhi fail hua, join_chat bhi fail hua, chahe unhe userbot
+    loop ke andar hi kyun na chalaya gaya ho.
+
+    FIX: Client ke wrapped methods (join_chat/get_chat/invoke) use NAHI
+    karte. Seedha userbot.session.invoke() use karte hain (Session class
+    sync wrapper se bandha nahi hai — plain async method hai, current
+    loop = userbot_loop par chalta hai). Phir fetch_peers() se channel
+    ko cache mein dalte hain (fetch_peers Client par defined hai,
+    Methods par nahi, isliye wrapped nahi hai).
 
     Returns dict: {ok, already, title, chat_id, error}."""
-    # 1) Pehle join karne ki koshish karo. Join hone par invoke ke
-    # andar fetch_peers se channel cache mein aa jata hai.
+    if getattr(userbot, "session", None) is None:
+        return {"ok": False, "error": "userbot session nahi mila"}
+    m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", invite_link)
+    if not m:
+        return {"ok": False, "error": "invite link samajh nahi aayi"}
+    invite_hash = m.group(1)
+
+    # 1) ImportChatInvite — join karne ki koshish karo.
     try:
-        chat = await userbot.join_chat(invite_link)
-        title = getattr(chat, "title", None) or getattr(chat, "username", None) or "channel"
-        chat_id = getattr(chat, "id", None)
+        r = await userbot.session.invoke(
+            raw.functions.messages.ImportChatInvite(hash=invite_hash)
+        )
+        # Result ke users/chats ko cache mein daalo.
         try:
-            await userbot.resolve_peer(chat_id)
-        except Exception as e:
-            print(f"Userbot resolve_peer fail after join: {e}")
-        return {"ok": True, "already": False, "title": title, "chat_id": chat_id}
+            await userbot.fetch_peers(getattr(r, "users", []) or [])
+            await userbot.fetch_peers(getattr(r, "chats", []) or [])
+        except Exception:
+            traceback.print_exc()
+        chats = getattr(r, "chats", []) or []
+        if chats:
+            chat_obj = chats[0]
+            title = getattr(chat_obj, "title", None) or "channel"
+            if isinstance(chat_obj, raw.types.Channel):
+                chat_id = utils.get_channel_id(chat_obj.id)
+            elif isinstance(chat_obj, raw.types.Chat):
+                chat_id = -chat_obj.id
+            else:
+                chat_id = getattr(chat_obj, "id", None)
+            return {"ok": True, "already": False, "title": title, "chat_id": chat_id}
+        return {"ok": True, "already": False, "title": "channel", "chat_id": None}
     except UserAlreadyParticipant:
         # Account pehle se member hai — join nahi hoga, par channel ko
         # cache mein dalna hai. Neeche CheckChatInvite se channel nikalo.
         pass
     except Exception:
-        print("Userbot join_chat fail:")
+        print("Userbot ImportChatInvite fail:")
         traceback.print_exc()
-        return {"ok": False, "error": "join fail (join_chat error)"}
+        return {"ok": False, "error": "join fail (ImportChatInvite error)"}
 
     # 2) Pehle se member hai — CheckChatInvite se channel ka object lo
     # aur fetch_peers se cache mein daalo.
-    m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", invite_link)
-    if not m:
-        return {"ok": False, "error": "invite link samajh nahi aayi"}
     try:
-        r = await userbot.invoke(
-            raw.functions.messages.CheckChatInvite(hash=m.group(1))
+        r = await userbot.session.invoke(
+            raw.functions.messages.CheckChatInvite(hash=invite_hash)
         )
     except Exception:
         print("Userbot CheckChatInvite fail:")
@@ -219,10 +247,6 @@ async def _userbot_join_and_resolve(invite_link):
     else:
         chat_id = getattr(chat_obj, "id", None)
     title = getattr(chat_obj, "title", None) or "channel"
-    try:
-        await userbot.resolve_peer(chat_id)
-    except Exception as e:
-        print(f"Userbot resolve_peer fail after resolve: {e}")
     return {"ok": True, "already": True, "title": title, "chat_id": chat_id}
 
 
