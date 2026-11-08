@@ -20,7 +20,7 @@ import asyncio
 import os
 import re
 from dotenv import load_dotenv, dotenv_values
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import (
     PeerIdInvalid,
@@ -365,9 +365,11 @@ async def link_handler(client: Client, message: Message):
 
 # ---------- Run ----------
 async def main():
-    """Userbot (agar SESSION_STRING ho) aur bot — dono shuru karo.
-    idle() ki jagah asyncio.Event().wait() use karte hain, taaki
-    do clients ke saath event loop mein koi takraar na ho."""
+    """Bot shuru karo (bot-only mode; userbot band hai).
+    idle() hi use karo — yehi woh tareeka hai jo 10:27 IST tak
+    kaam kar raha tha. asyncio.Event().wait() se bot updates
+    poll nahi kar pa raha tha (Telegram par 17 updates pending
+    mile), isliye idle() wapas la rahe hain."""
     global userbot
     if userbot is not None:
         try:
@@ -381,9 +383,7 @@ async def main():
             userbot = None
     await app.start()
     print("Post Link Fetcher Bot online hai.")
-    # Dono clients background mein updates sunte rehte hain;
-    # process ko zinda rakhne ke liye bas wait karo.
-    await asyncio.Event().wait()
+    await idle()
 
 
 if __name__ == "__main__":
