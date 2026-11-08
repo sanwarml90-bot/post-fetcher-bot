@@ -10,10 +10,11 @@
 #  - PUBLIC bot — koi bhi user use kar sakta hai
 #  - 50 MB se badi file par mana kar deta hai (Bot API limit)
 #  - Link ke forms: t.me/<username>/<msg_id> aur t.me/c/<chat_id>/<msg_id>
-#  - USERBOT: SESSION_STRING se ek user account (@Costombomber) bhi
-#    chalata hai — private/protected channels ki posts fetch karne
-#    ke liye (jinmein bot account ko access nahi hai). Userbot na
-#    ho to bot account se fetch karta hai (public channels).
+#  - USERBOT: SESSION_STRING se ek user account (dedicated link-bot
+#    account, user id 6278892307, no username) bhi chalata hai —
+#    private/protected channels ki posts fetch karne ke liye
+#    (jinmein bot account ko access nahi hai). Userbot na ho to
+#    bot account se fetch karta hai (public channels).
 # ============================================================
 
 import asyncio
@@ -43,8 +44,8 @@ _aand_env = dotenv_values(os.path.expanduser("~/workspace/aand_bot/.env"))
 API_ID = int(os.getenv("API_ID") or _aand_env.get("API_ID", "0"))
 API_HASH = os.getenv("API_HASH") or _aand_env.get("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-# Userbot session (@Costombomber user account) — env se hi padho,
-# kabhi file mein hardcode mat karo, kabhi print mat karo.
+# Userbot session (dedicated link-bot account, user id 6278892307) —
+# env se hi padho, kabhi file mein hardcode mat karo, kabhi print mat karo.
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 DOWNLOADS_DIR = "downloads"
@@ -63,21 +64,27 @@ app = Client("post_fetcher", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOK
 # alag hain — sirf plain data (file path, naam, size) share hota hai.
 # Session: naya dedicated account (user id 6278892307, +91 8233779129)
 # — Costombomber TTS ke liye hai, ye link bot ke liye hai.
+#
+# ZAROORI: userbot ka Client USI thread ke andar banao jismein
+# uska loop chalega. Client module level (main thread) mein banane
+# par uska loop main loop se bandh jata hai, aur thread ke loop
+# mein use karne par "Future attached to a different loop" error
+# aata hai — fetch fail hota hai aur error flood se logs bhar jate
+# hain (Railway 500 logs/sec rate limit bhi lag jata hai).
 userbot = None
 userbot_loop = None
 userbot_ready = threading.Event()
 
-if SESSION_STRING:
+
+async def _userbot_main():
+    """Userbot ke loop mein chalao: client banao, start karo, phir ruko."""
+    global userbot
     userbot = Client(
         "post_fetcher_userbot",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING,
     )
-
-
-async def _userbot_main():
-    """Userbot ke loop mein chalao: start karo, phir hamesha ke liye ruko."""
     await userbot.start()
     me = await userbot.get_me()
     print(f"Userbot shuru ho gaya: @{me.username}")
@@ -102,7 +109,7 @@ def _run_userbot_thread():
 
 def start_userbot_thread():
     """Userbot thread shuru karo (agar SESSION_STRING ho)."""
-    if userbot is None:
+    if not SESSION_STRING:
         return False
     t = threading.Thread(target=_run_userbot_thread, daemon=True)
     t.start()
@@ -133,16 +140,19 @@ async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
     }
 
 
-def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
+async def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
     """Bot ke handler se call karo: userbot thread par fetch+download
-    karwao aur result lo. Userbot na ho ya fail ho to None wapas do."""
+    karwao aur result lo. ASYNC hai — wrap_future se main loop block
+    nahi hota (pehle fut.result() se loop 120 sec tak atak jata tha,
+    isliye naye messages ka reply bhi late aata tha).
+    Userbot na ho ya fail ho to None wapas do."""
     if userbot is None or userbot_loop is None:
         return None
     try:
         fut = asyncio.run_coroutine_threadsafe(
             _userbot_fetch_and_download(chat, msg_id, tmp_path), userbot_loop
         )
-        return fut.result(timeout=timeout)
+        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
     except Exception as e:
         print(f"Userbot fetch fail: {e}")
         return None
@@ -333,7 +343,7 @@ async def link_handler(client: Client, message: Message):
         ub_tmp = os.path.join(
             DOWNLOADS_DIR, f"{message.from_user.id}_{msg_id}_ub.tmp"
         )
-        ub = userbot_fetch(chat, msg_id, ub_tmp)
+        ub = await userbot_fetch(chat, msg_id, ub_tmp)
         if ub is not None and ub.get("ok"):
             if not ub.get("has_file"):
                 await status.edit_text(
