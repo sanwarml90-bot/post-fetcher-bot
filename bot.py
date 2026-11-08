@@ -76,6 +76,15 @@ if SESSION_STRING:
     )
 
 
+async def _userbot_main():
+    """Userbot ke loop mein chalao: start karo, phir hamesha ke liye ruko."""
+    await userbot.start()
+    me = await userbot.get_me()
+    print(f"Userbot shuru ho gaya: @{me.username}")
+    userbot_ready.set()
+    await asyncio.Event().wait()
+
+
 def _run_userbot_thread():
     """Background thread: userbot ka apna event loop chalao."""
     global userbot_loop
@@ -83,11 +92,9 @@ def _run_userbot_thread():
     asyncio.set_event_loop(loop)
     userbot_loop = loop
     try:
-        loop.run_until_complete(userbot.start())
-        me = loop.run_until_complete(userbot.get_me())
-        print(f"Userbot shuru ho gaya: @{me.username}")
-        userbot_ready.set()
-        loop.run_forever()
+        # Poora lifecycle ek hi async function mein chalao, taaki
+        # start() sahi async context mein await ho.
+        loop.run_until_complete(_userbot_main())
     except Exception as e:
         print(f"Userbot start nahi hua ({e}) — bot-only mode mein chal raha hai.")
         userbot_ready.set()
