@@ -158,28 +158,23 @@ async def _userbot_fetch_and_download(chat, msg_id, tmp_path):
     }
 
 
-async def _run_on_userbot_loop(coro, timeout=60):
-    """Userbot ke loop par ek coroutine chalao, result lo."""
-    fut = asyncio.run_coroutine_threadsafe(coro, userbot_loop)
-    return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+async def _userbot_join_and_resolve(invite_link):
+    """Userbot ke loop mein chalao: invite link resolve karo, join karo,
+    cache check karo. Sab Pyrogram calls ISI loop ke andar hone chahiye.
 
+    ZAROORI: userbot.get_chat()/join_chat() ka coroutine main thread
+    mein bana kar userbot loop mein bhejne par "Future attached to a
+    different loop" error aata hai — Pyrogram ka coroutine usi loop
+    se bandh jata hai jahan use banaya gaya. Isiliye get_chat/join_chat
+    ko yahin andar call karo, bahar se coro mat bhejo. (Yahi wajah thi
+    jo fetch path mein pehle fix ki gayi thi — wahan apna coroutine
+    bhejte hain, Pyrogram calls andar hoti hain.)
 
-async def userbot_join(invite_link, timeout=60):
-    """Userbot ko invite link se channel/group mein join karwao.
-    Returns dict: {ok, already, title, chat_id, error}.
-    - Pehle invite link resolve karke channel ka pata lagao
-      (get_chat) — is se peer cache bhi bhar jata hai, phir
-      us channel ki post fetch kaam karti hai.
-    - Account pehle se member ho (UserAlreadyParticipant) to use
-      SUCCESS mano, fail nahi. Pehle ye case galat tareeke se
-      "link galat/expire" bol kar fail ho jata tha — jabki link
-      sahi hoti thi, account pehle se joined hota tha."""
-    if userbot is None or userbot_loop is None:
-        return {"ok": False, "error": "userbot nahi chal raha"}
+    Returns dict: {ok, already, title, chat_id, error}."""
     try:
-        chat = await _run_on_userbot_loop(
-            userbot.get_chat(invite_link), timeout=timeout
-        )
+        # Invite link resolve karo — is se peer cache bhi bhar jata hai,
+        # phir us channel ki post fetch kaam karti hai.
+        chat = await userbot.get_chat(invite_link)
     except Exception as e:
         print(f"Userbot invite resolve fail: {e}")
         return {"ok": False, "error": f"invite link resolve nahi hui: {e}"}
@@ -187,10 +182,9 @@ async def userbot_join(invite_link, timeout=60):
     chat_id = getattr(chat, "id", None)
     already = False
     try:
-        await _run_on_userbot_loop(
-            userbot.join_chat(invite_link), timeout=timeout
-        )
+        await userbot.join_chat(invite_link)
     except UserAlreadyParticipant:
+        # Account pehle se member hai — ye SUCCESS hai, fail nahi.
         already = True
     except Exception as e:
         print(f"Userbot join fail: {e}")
@@ -202,10 +196,27 @@ async def userbot_join(invite_link, timeout=60):
         }
     # Cache check: join ke baad channel resolve ho raha hai ya nahi
     try:
-        await _run_on_userbot_loop(userbot.resolve_peer(chat_id), timeout=30)
+        await userbot.resolve_peer(chat_id)
     except Exception as e:
         print(f"Userbot resolve_peer fail after join: {e}")
     return {"ok": True, "already": already, "title": title, "chat_id": chat_id}
+
+
+async def userbot_join(invite_link, timeout=60):
+    """Userbot ko invite link se channel/group mein join karwao.
+    Returns dict: {ok, already, title, chat_id, error}.
+    Apna coroutine userbot loop mein bhejta hai (fetch path jaisa) —
+    Pyrogram calls andar hoti hain, isliye loop error nahi aata."""
+    if userbot is None or userbot_loop is None:
+        return {"ok": False, "error": "userbot nahi chal raha"}
+    try:
+        fut = asyncio.run_coroutine_threadsafe(
+            _userbot_join_and_resolve(invite_link), userbot_loop
+        )
+        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+    except Exception as e:
+        print(f"Userbot join fail: {e}")
+        return {"ok": False, "error": f"join fail: {e}"}
 
 
 async def userbot_fetch(chat, msg_id, tmp_path, timeout=120):
