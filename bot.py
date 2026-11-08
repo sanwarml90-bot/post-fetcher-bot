@@ -10,12 +10,17 @@
 #  - PUBLIC bot — koi bhi user use kar sakta hai
 #  - 50 MB se badi file par mana kar deta hai (Bot API limit)
 #  - Link ke forms: t.me/<username>/<msg_id> aur t.me/c/<chat_id>/<msg_id>
+#  - USERBOT: SESSION_STRING se ek user account (@Costombomber) bhi
+#    chalata hai — private/protected channels ki posts fetch karne
+#    ke liye (jinmein bot account ko access nahi hai). Userbot na
+#    ho to bot account se fetch karta hai (public channels).
 # ============================================================
 
+import asyncio
 import os
 import re
 from dotenv import load_dotenv, dotenv_values
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import (
     PeerIdInvalid,
@@ -28,7 +33,7 @@ from pyrogram.errors import (
 )
 
 # ---------- Config ----------
-# Local .env (BOT_TOKEN) load karo
+# Local .env (BOT_TOKEN, SESSION_STRING) load karo
 load_dotenv()
 
 # API_ID / API_HASH Aand bot ki .env se lo (shared API credentials).
@@ -37,6 +42,9 @@ _aand_env = dotenv_values(os.path.expanduser("~/workspace/aand_bot/.env"))
 API_ID = int(os.getenv("API_ID") or _aand_env.get("API_ID", "0"))
 API_HASH = os.getenv("API_HASH") or _aand_env.get("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# Userbot session (@Costombomber user account) — env se hi padho,
+# kabhi file mein hardcode mat karo, kabhi print mat karo.
+SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
@@ -45,6 +53,18 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB in bytes
 
 app = Client("post_fetcher", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Userbot client (@Costombomber) — sirf tab banao jab SESSION_STRING ho.
+# Ye private/protected channels ki posts fetch karta hai, kyunki ye
+# account un channels ka member hai. Bot sirf file wapas bhejta hai.
+userbot = None
+if SESSION_STRING:
+    userbot = Client(
+        "post_fetcher_userbot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=SESSION_STRING,
+    )
 
 # ---------- Helpers ----------
 # Message mein se pehli t.me link nikalo
@@ -167,7 +187,8 @@ async def start_handler(client: Client, message: Message):
         "3️⃣ Bot us post ki file fetch karke tumhe bhej dega\n\n"
         "**Note:**\n"
         "• Public channels ki posts ke liye kaam karta hai\n"
-        "• Private channel/group ke liye bot ko usmein member hona chahiye\n"
+        "• Private/protected (no-forward) channels ki posts bhi fetch kar leta hai — "
+        "userbot account unka member hai, isliye bot ko add karne ki zaroorat nahi\n"
         "• Sirf **50 MB** tak ki files fetch kar sakta hai\n\n"
         "👉 Ab ek post ki link bhej kar try karo!"
     )
@@ -189,7 +210,8 @@ async def help_handler(client: Client, message: Message):
         "1. Post ki link bhejo\n"
         "2. Bot file fetch karega aur tumhe bhej dega\n\n"
         "**Agar error aaye:**\n"
-        "• “Bot ko access nahi hai” — bot ko us channel mein add karo\n"
+        "• “Bot ko access nahi hai” — us channel mein userbot account member nahi hai; "
+        "userbot account ko channel mein add karo\n"
         "• “Link galat hai” — link dobara check karo\n"
         "• “Post nahi mili” — post delete ho gayi hogi"
     )
@@ -224,9 +246,12 @@ async def link_handler(client: Client, message: Message):
 
     status = await message.reply_text("🔍 Post dhoondh raha hun, rukho...")
 
-    # Post fetch karo
+    # Post fetch karo — pehle userbot se (private/protected channels ke liye),
+    # userbot na ho to bot account se (public channels ke liye).
+    # msg.download() usi client se hota hai jisne message fetch kiya.
+    fetch_client = userbot if userbot is not None else client
     try:
-        msg = await client.get_messages(chat, msg_id)
+        msg = await fetch_client.get_messages(chat, msg_id)
     except FloodWait as e:
         await status.edit_text(
             f"⏳ Telegram ne thoda rok lagayi hai. "
@@ -235,15 +260,16 @@ async def link_handler(client: Client, message: Message):
         return
     except (ChannelPrivate, ChannelInvalid):
         await status.edit_text(
-            "🔒 **Bot ko us channel/group ka access nahi hai.**\n\n"
-            "Bot ko us channel mein add karo (member/admin banao), "
+            "🔒 **Us channel/group ka access nahi hai.**\n\n"
+            "Userbot account ko us channel mein add karo (member banao), "
             "phir link bhejo."
         )
         return
     except (UsernameInvalid, UsernameNotOccupied, PeerIdInvalid):
         await status.edit_text(
             "❌ **Link galat hai — ye channel/username nahi mila.**\n\n"
-            "Link dobara check karo."
+            "Link dobara check karo. Private channel ke liye userbot "
+            "account ko us channel ka member hona chahiye."
         )
         return
     except MessageIdInvalid:
@@ -335,6 +361,27 @@ async def link_handler(client: Client, message: Message):
 
 
 # ---------- Run ----------
+async def main():
+    """Userbot (agar SESSION_STRING ho) aur bot — dono shuru karo."""
+    global userbot
+    if userbot is not None:
+        try:
+            await userbot.start()
+            me = await userbot.get_me()
+            print(f"Userbot shuru ho gaya: @{me.username}")
+        except Exception as e:
+            # Userbot session kharab ho to bot-only mode mein chalao,
+            # poora bot band mat karo.
+            print(f"Userbot start nahi hua ({e}) — bot-only mode mein chal raha hai.")
+            userbot = None
+    await app.start()
+    print("Post Link Fetcher Bot online hai.")
+    await idle()
+    await app.stop()
+    if userbot is not None:
+        await userbot.stop()
+
+
 if __name__ == "__main__":
     print("Post Link Fetcher Bot shuru ho raha hai...")
-    app.run()
+    asyncio.run(main())
