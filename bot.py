@@ -12,6 +12,12 @@
 #    Telethon userbot seedha user ko bhejta hai (Bot API ki 50 MB limit
 #    ki wajah se)
 #  - Link ke forms: t.me/<username>/<msg_id> aur t.me/c/<chat_id>/<msg_id>
+#  - Text-only post ki link bhejo to uska text bhejta hai (tukdon mein,
+#    chahe kitna bhi lamba ho)
+#  - Channel/group ki link (t.me/<username>, sirf owner) bhejo to userbot
+#    use join kar leta hai (invite link se bhi)
+#  - Har fetch/join reply mein userbot account ki pehchan bhi dikhata hai
+#    (@username ho to, warna naam + ID)
 #  - USERBOT (Telethon): SESSION_STRING se ek user account (dedicated
 #    link-bot account, user id 6278892307, no username) bhi chalata hai —
 #    private/protected channels ki posts fetch karne ke liye (jinmein bot
@@ -52,12 +58,17 @@ from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
     ImportChatInviteRequest,
 )
+from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl import types as tele_types
 from telethon.errors import (
     FloodWaitError as TeleFloodWait,
     ChannelPrivateError as TeleChannelPrivate,
     InviteHashExpiredError as TeleInviteExpired,
     InviteHashInvalidError as TeleInviteInvalid,
+    UserAlreadyParticipantError as TeleAlreadyParticipant,
+    UserNotParticipantError as TeleNotParticipant,
+    UsernameInvalidError as TeleUsernameInvalid,
+    UsernameNotOccupiedError as TeleUsernameNotOccupied,
 )
 
 # ---------- Config ----------
@@ -104,12 +115,16 @@ app = Client("post_fetcher", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOK
 # Telethon client ko start_telethon() se main loop par start karte hain,
 # phir app.run() usi loop par bot chalata hai.
 tele_client = None
+# Userbot account ki pehchan (username / naam / ID) — start_telethon()
+# mein bhari jati hai; replies mein dikhate hain taaki pata chale kaun
+# sa account fetch/join kar raha hai.
+TELE_ME = None
 
 
 async def start_telethon():
     """Telethon userbot ko main loop par start karo. SESSION_STRING ek
     Telethon StringSession honi chahiye (Pyrogram string nahi chalegi)."""
-    global tele_client
+    global tele_client, TELE_ME
     if not SESSION_STRING:
         print("Telethon SESSION_STRING nahi hai — bot-only mode.")
         return False
@@ -120,6 +135,7 @@ async def start_telethon():
     )
     await tele_client.start()
     me = await tele_client.get_me()
+    TELE_ME = {"username": me.username, "first_name": me.first_name, "id": me.id}
     print(f"Telethon userbot shuru ho gaya: @{me.username} ID:{me.id}")
     return True
 
@@ -208,6 +224,45 @@ async def tele_join(invite_link, timeout=60):
         return {"ok": False, "error": f"join fail: {e}"}
 
 
+async def tele_join_public(username, timeout=60):
+    """Telethon userbot ko PUBLIC channel/group (t.me/<username>) mein
+    join karwao. Returns dict: {ok, already, title, chat_id, error}.
+    Pehle get_permissions se check karte hain — account pehle se member
+    ho to dobara join kiye bina 'already' batate hain."""
+    if tele_client is None:
+        return {"ok": False, "error": "userbot nahi chal raha"}
+    try:
+        entity = await tele_client.get_entity(username)
+    except (TeleUsernameInvalid, TeleUsernameNotOccupied, ValueError) as e:
+        return {"ok": False, "error": f"ye username/channel nahi mila ({e})"}
+    except Exception as e:
+        return {"ok": False, "error": f"channel resolve nahi hua: {e}"}
+    if isinstance(entity, tele_types.User):
+        return {"ok": False, "error": "ye kisi user ka link hai, channel/group nahi"}
+    if not isinstance(entity, (tele_types.Channel, tele_types.Chat)):
+        return {"ok": False, "error": "ye channel/group nahi hai"}
+    # Pehle se member?
+    try:
+        await tele_client.get_permissions(entity, "me")
+        return {"ok": True, "already": True, **_tele_chat_info(entity)}
+    except TeleNotParticipant:
+        pass
+    except Exception:
+        pass
+    try:
+        updates = await tele_client(JoinChannelRequest(username))
+        chats = getattr(updates, "chats", None) or []
+        if not chats:
+            return {"ok": False, "error": "join ke baad channel nahi mila"}
+        return {"ok": True, "already": False, **_tele_chat_info(chats[0])}
+    except TeleAlreadyParticipant:
+        return {"ok": True, "already": True, **_tele_chat_info(entity)}
+    except Exception as e:
+        print(f"Telethon public join fail: {e}")
+        traceback.print_exc()
+        return {"ok": False, "error": f"join fail: {e}"}
+
+
 def _tele_chat_info(chat):
     """Telethon chat object se {title, chat_id} nikalo.
     Channel ke liye full ID -100... hota hai, group ke liye -id."""
@@ -281,6 +336,84 @@ def parse_telegram_link(link: str):
     return None, None
 
 
+def parse_channel_link(link: str):
+    """Bare channel/group link (t.me/<username>, message ID ke bina) ho
+    to username wapas do, warna None. Post links (msg ID wali), private
+    c/ links aur invite links yahan nahi aate — unke liye alag rasta hai."""
+    if not link:
+        return None
+    link = link.strip().split("?")[0].split("#")[0].rstrip("/")
+    m = re.match(r"^(?:https?://)?t\.me/(.+)$", link, re.IGNORECASE)
+    if not m:
+        return None
+    parts = [p for p in m.group(1).split("/") if p]
+    if len(parts) != 1:
+        return None
+    name = parts[0]
+    if name.lower() in ("c", "s") or name.startswith(("+", "joinchat")):
+        return None
+    return name
+
+
+def userbot_tag():
+    """Userbot account ki pehchan — fetch/join replies ke footer mein.
+    Username ho to @username, warna naam + ID (account ka username
+    nahi hai to ID hi pehchan hai). Userbot start na hua ho to ""."""
+    if not TELE_ME:
+        return ""
+    u = TELE_ME.get("username")
+    if u:
+        return f"\n\n🤖 via userbot: @{u}"
+    name = TELE_ME.get("first_name") or "userbot"
+    return f"\n\n🤖 via userbot: {name} (ID: {TELE_ME.get('id')})"
+
+
+def build_file_caption(file_name, user_caption, tag=""):
+    """File send karne wali caption banao — Telegram ki 1024 char limit
+    ke andar rakho (tag hamesha bana rahe)."""
+    head = f"📦 **File mil gayi!**\n\n📄 **Naam:** `{file_name}`"
+    tail = tag or ""
+    body = ""
+    if user_caption:
+        prefix = "\n\n💬 **Caption:** "
+        budget = 1020 - len(head) - len(tail) - len(prefix)
+        cap = user_caption.strip()
+        if len(cap) > budget:
+            cap = cap[:max(budget - 1, 0)] + "…"
+        body = prefix + cap
+    return head + body + tail
+
+
+def split_text(text, limit=4000):
+    """Lambi text ko Telegram limit (4096) ke hisaab se tukdon mein todo.
+    Newline par todne ki koshish karo, warna hard cut."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    rest = text
+    while len(rest) > limit:
+        cut = rest.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(rest[:cut])
+        rest = rest[cut:].lstrip("\n")
+    if rest:
+        chunks.append(rest)
+    return chunks
+
+
+async def send_text_chunks(client, chat_id, text, reply_to_message_id=None):
+    """Text (chahe kitni bhi lambi ho) tukdon mein bhejo — pehla tukda
+    reply ke roop mein, baaki plain messages."""
+    for i, chunk in enumerate(split_text(text)):
+        if i == 0 and reply_to_message_id:
+            await client.send_message(
+                chat_id, chunk, reply_to_message_id=reply_to_message_id
+            )
+        else:
+            await client.send_message(chat_id, chunk)
+
+
 def sanitize_filename(name: str) -> str:
     """Filename mein allowed nahi hone wale characters hatao: / \\ : * ? " < > |"""
     name = re.sub(r'[/\\:*?"<>|]', "", name)
@@ -344,7 +477,9 @@ async def start_handler(client: Client, message: Message):
         "• Private/protected (no-forward) channels ki posts bhi fetch kar leta hai — "
         "userbot account unka member hai, isliye bot ko add karne ki zaroorat nahi\n"
         "• **500 MB** tak ki files fetch kar sakta hai (50 MB se badi file "
-        "userbot se seedha bhejta hai)\n\n"
+        "userbot se seedha bhejta hai)\n"
+        "• Text-only post ki link bhejo to uska **text** bhej dunga\n"
+        "• Channel/group ki link bhejo (sirf owner) to userbot use **join** kar lega\n\n"
         "👉 Ab ek post ki link bhej kar try karo!"
     )
 
@@ -360,7 +495,8 @@ async def help_handler(client: Client, message: Message):
         "**Link ke examples:**\n"
         "• `https://t.me/channelname/123`\n"
         "• `https://t.me/c/1234567890/123` (private channel)\n"
-        "• `t.me/channelname/123`\n\n"
+        "• `t.me/channelname/123`\n"
+        "• `https://t.me/channelname` — channel/group join (sirf owner)\n\n"
         "**Steps:**\n"
         "1. Post ki link bhejo\n"
         "2. Bot file fetch karega aur tumhe bhej dega\n\n"
@@ -368,7 +504,9 @@ async def help_handler(client: Client, message: Message):
         "• “Bot ko access nahi hai” — us channel mein userbot account member nahi hai; "
         "userbot account ko channel mein add karo\n"
         "• “Link galat hai” — link dobara check karo\n"
-        "• “Post nahi mili” — post delete ho gayi hogi"
+        "• “Post nahi mili” — post delete ho gayi hogi\n"
+        "• Text-only post ki link bhejo to uska text bhej dunga\n"
+        "• Channel/group ki link bhejo to userbot use join kar lega (sirf owner)"
     )
 
 
@@ -393,12 +531,44 @@ async def link_handler(client: Client, message: Message):
         if result.get("ok"):
             if result.get("already"):
                 await status.edit_text(
-                    f"✅ **Account pehle se hi is channel mein hai: {result.get('title')}**\n\n"
+                    f"✅ **Account pehle se hi is channel mein hai: {result.get('title')}**{userbot_tag()}\n\n"
                     "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
                 )
             else:
                 await status.edit_text(
-                    f"✅ **Userbot join ho gaya: {result.get('title')}**\n\n"
+                    f"✅ **Userbot join ho gaya: {result.get('title')}**{userbot_tag()}\n\n"
+                    "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
+                )
+        else:
+            await status.edit_text(
+                f"❌ **Join nahi ho paya.**\n\nReason: {result.get('error')}"
+            )
+        return
+
+    # BARE CHANNEL/GROUP LINK: t.me/<username> (post link nahi) —
+    # owner userbot ko us channel/group mein join karwana chahta hai
+    # (uske baad us channel ki posts fetch ho jayengi).
+    # Sirf owner (Sanji) ke liye — invite join jaisa hi rule.
+    bare = parse_channel_link(extract_link(text))
+    if bare:
+        if message.from_user.id != OWNER_ID:
+            await message.reply_text(
+                "🔒 Ye feature sirf bot ke owner ke liye hai."
+            )
+            return
+        status = await message.reply_text(
+            "🔗 Userbot ko channel/group mein join karwa raha hun, rukho..."
+        )
+        result = await tele_join_public(bare)
+        if result.get("ok"):
+            if result.get("already"):
+                await status.edit_text(
+                    f"✅ **Account pehle se hi is channel/group mein hai: {result.get('title')}**{userbot_tag()}\n\n"
+                    "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
+                )
+            else:
+                await status.edit_text(
+                    f"✅ **Userbot join ho gaya: {result.get('title')}**{userbot_tag()}\n\n"
                     "Ab us channel ki post ki link bhejo, file fetch ho jayegi."
                 )
         else:
@@ -440,17 +610,30 @@ async def link_handler(client: Client, message: Message):
         ub = await tele_fetch(chat, msg_id, ub_tmp)
         if ub is not None and ub.get("ok"):
             if not ub.get("has_file"):
-                await status.edit_text(
-                    "📝 **Is post mein koi file nahi hai.**\n\n"
-                    "Ye post sirf text hai — ismein koi photo, video ya file nahi hai."
-                )
+                # Text-only post — jo text mila wo bhej do (file nahi hai
+                # to "koi file nahi" keh kar text chhupana nahi).
+                post_text = (ub.get("caption") or "").strip()
+                if post_text:
+                    await status.edit_text(
+                        f"✅ **Text mil gaya!**{userbot_tag()}"
+                    )
+                    await send_text_chunks(
+                        client,
+                        message.chat.id,
+                        post_text,
+                        reply_to_message_id=message.id,
+                    )
+                else:
+                    await status.edit_text(
+                        "📝 **Is post mein koi file nahi hai.**\n\n"
+                        "Ye post sirf text hai — ismein koi photo, video ya file nahi hai."
+                        f"{userbot_tag()}"
+                    )
                 return
             ub_name = ub["file_name"]
             ub_size = ub.get("file_size")
             ub_caption = ub.get("caption") or ""
-            caption = f"📦 **File mil gayi!**\n\n📄 **Naam:** `{ub_name}`"
-            if ub_caption:
-                caption += f"\n\n💬 **Caption:** {ub_caption}"
+            caption = build_file_caption(ub_name, ub_caption, userbot_tag())
             # 50 MB se badi file Bot API se nahi bhej sakte (Telegram ki
             # hard limit) — isliye Telethon userbot use seedha user ko
             # bhejta hai (user account 2 GB tak bhej sakta hai).
@@ -467,6 +650,7 @@ async def link_handler(client: Client, message: Message):
                     await status.edit_text(
                         "✅ **Ho gaya! File bhej di (userbot se, kyunki "
                         "file 50 MB se badi hai).**"
+                        f"{userbot_tag()}"
                     )
                 except TeleFloodWait as e:
                     await status.edit_text(
@@ -561,10 +745,21 @@ async def link_handler(client: Client, message: Message):
     # Media hai ya nahi?
     file_name, file_size = get_media_info(msg)
     if not file_name:
-        await status.edit_text(
-            "📝 **Is post mein koi file nahi hai.**\n\n"
-            "Ye post sirf text hai — ismein koi photo, video ya file nahi hai."
-        )
+        # Text-only post — jo text mila wo bhej do.
+        post_text = (msg.text or "").strip()
+        if post_text:
+            await status.edit_text("✅ **Text mil gaya!**")
+            await send_text_chunks(
+                client,
+                message.chat.id,
+                post_text,
+                reply_to_message_id=message.id,
+            )
+        else:
+            await status.edit_text(
+                "📝 **Is post mein koi file nahi hai.**\n\n"
+                "Ye post sirf text hai — ismein koi photo, video ya file nahi hai."
+            )
         return
 
     # File size check (Bot API 50 MB limit — bot account se zyada nahi bhej sakte)
@@ -599,9 +794,7 @@ async def link_handler(client: Client, message: Message):
         return
 
     # File user ko bhejo (document ke roop mein, original naam ke saath)
-    caption = f"📦 **File mil gayi!**\n\n📄 **Naam:** `{file_name}`"
-    if msg.caption:
-        caption += f"\n\n💬 **Caption:** {msg.caption}"
+    caption = build_file_caption(file_name, msg.caption or "")
     try:
         await client.send_document(
             message.chat.id,

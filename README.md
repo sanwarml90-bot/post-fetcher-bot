@@ -6,9 +6,12 @@ Telegram post ki link bhejo, us post ki file pao!
 
 Tum kisi Telegram post ki link bhejte ho (jaise `https://t.me/channelname/123`),
 bot us post ki file nikaal kar tumhe bhej deta hai. Un channels ke liye bhi
-kaam karta hai jahan forwarding allowed nahi hai — **userbot** (@Costombomber
-user account) un channels ka member hai, isliye file fetch kar leta hai;
+kaam karta hai jahan forwarding allowed nahi hai — **userbot** (dedicated
+link-bot user account) un channels ka member hai, isliye file fetch kar leta hai;
 bot ko channel mein add karne ki zaroorat nahi hai.
+Text-only post ki link bhejo to uska **text** bhej dunga, aur channel/group
+ki link bhejo (sirf owner) to userbot use **join** kar lega — invite link
+se bhi. Har fetch/join reply mein userbot account ki pehchan bhi dikhata hai.
 
 **Supported media:** document, photo, video, audio, animation (GIF),
 voice, video note. Photo ko document ke roop mein bhejta hai taaki
@@ -39,7 +42,7 @@ SESSION_STRING=apna_session_string_yahan
 - **API_ID / API_HASH** — [my.telegram.org](https://my.telegram.org) se milega.
   (Agar Aand bot ki `.env` hai to bot khud wahan se padh lega,
   par Railway/hosting par ye variables set karna behtar hai.)
-- **SESSION_STRING** — @Costombomber user account ka session string.
+- **SESSION_STRING** — dedicated link-bot user account ka session string.
   Ye **userbot** chalata hai, jo private/protected (no-forward) channels
   ki posts fetch karta hai — un channels mein ye account member hona
   chahiye. Session string sirf **environment variable** (Railway Variables)
@@ -69,9 +72,9 @@ python bot.py
 
 ## Agar error aaye
 
-- **“Us channel/group ka access nahi hai”** — userbot account (@Costombomber)
+- **“Us channel/group ka access nahi hai”** — userbot account
   us channel ka member nahi hai; use channel mein add karo, phir link bhejo.
 - **“Link galat hai”** — link dobara check karo.
 - **“Post nahi mili”** — post delete ho gayi hogi.
 - **“File bahut badi hai”** — 50 MB se badi file bot fetch nahi kar sakta.
-- **“Is post mein koi file nahi hai”** — post sirf text hai.
+- **“Is post mein koi file nahi hai”** — post mein na text hai na file.
